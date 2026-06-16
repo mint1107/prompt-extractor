@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>メタプロンプト抽出（ポジティブ）</title>
+<style>
+  :root { --bg:#11131a; --card:#1b1f2a; --line:#2c3242; --accent:#7c83ff; --ok:#39d98a; --ng:#ff6b6b; --fg:#e7e9f0; --muted:#8b91a3; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:"Segoe UI","Yu Gothic UI",sans-serif; padding:28px; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
+  #drop { border:2px dashed var(--line); border-radius:14px; padding:46px 20px; text-align:center;
+          color:var(--muted); transition:.15s; cursor:pointer; background:var(--card); }
+  #drop.hot { border-color:var(--accent); color:var(--fg); background:#222842; }
+  #drop b { color:var(--accent); }
+  .bar { display:flex; gap:10px; align-items:center; margin:18px 0 6px; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 14px; font-size:13px; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  button:disabled { opacity:.4; cursor:default; }
+  .count { color:var(--muted); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin:12px 0; }
+  .card .fn { font-size:12px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .tag { font-size:11px; padding:2px 8px; border-radius:20px; white-space:nowrap; }
+  .tag.ok { background:rgba(57,217,138,.15); color:var(--ok); }
+  .tag.ng { background:rgba(255,107,107,.15); color:var(--ng); }
+  textarea { width:100%; margin-top:10px; background:#0d0f15; color:var(--fg); border:1px solid var(--line);
+             border-radius:8px; padding:10px; font-family:Consolas,monospace; font-size:13px; line-height:1.5; resize:vertical; min-height:90px; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .copyd { color:var(--ok); font-size:12px; align-self:center; opacity:0; transition:.2s; }
+  .copyd.show { opacity:1; }
+  .fmt { font-size:13px; color:var(--fg); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
+  .fmt input { accent-color:var(--accent); width:15px; height:15px; }
+</style>
+</head>
+<body>
+  <h1>🎨 メタプロンプト抽出ツール</h1>
+  <div class="sub">ComfyUI / A1111(Forge) で生成したPNGをドロップ → <b>ポジティブプロンプト</b>だけを抜き出します。複数まとめてOK。サーバー不要・このファイルを開くだけ。</div>
+
+  <div id="drop">
+    ここに画像を <b>ドラッグ&ドロップ</b><br>
+    <span style="font-size:12px">（またはクリックして選択 / 複数可）</span>
+    <input type="file" id="file" accept="image/png,image/*" multiple style="display:none">
+  </div>
+
+  <div class="bar">
+    <span class="count" id="count">0 件</span>
+    <label class="fmt"><input type="checkbox" id="fmt"> ✨ 1行に整形（カンマ区切り）</label>
+    <button class="ghost" id="csv" disabled>📋 CSVをダウンロード</button>
+    <button class="ghost" id="clear" disabled>クリア</button>
+  </div>
+
+  <div id="list"></div>
+
+<script>
+/* ===================== PNGメタデータ読み取り ===================== */
+async function readPngText(buf){
+  const d = new Uint8Array(buf);
+  // PNGシグネチャ確認
+  const sig = [137,80,78,71,13,10,26,10];
+  for (let i=0;i<8;i++) if (d[i]!==sig[i]) throw new Error('PNGファイルではありません');
+  const dv = new DataView(buf);
+  const out = {};
+  let pos = 8;
+  while (pos < d.length){
+    const len = dv.getUint32(pos);
+    const type = String.fromCharCode(d[pos+4],d[pos+5],d[pos+6],d[pos+7]);
+    const start = pos+8;
+    const body = d.subarray(start, start+len);
+    if (type==='tEXt'){
+      const z = body.indexOf(0);
+      const key = utf8(body.subarray(0,z));
+      out[key] = utf8(body.subarray(z+1));        // 値はUTF-8として復号(ComfyUI仕様)
+    } else if (type==='iTXt'){
+      const z = body.indexOf(0);
+      const key = utf8(body.subarray(0,z));
+      const compFlag = body[z+1];
+      // z+2: compression method, 続いて lang\0 translated\0 text
+      let p = z+3;
+      p = body.indexOf(0,p)+1;                      // language tag
+      p = body.indexOf(0,p)+1;                      // translated keyword
+      const textBytes = body.subarray(p);
+      out[key] = compFlag ? await inflate(textBytes) : utf8(textBytes);
+    } else if (type==='zTXt'){
+      const z = body.indexOf(0);
+      const key = utf8(body.subarray(0,z));
+      const textBytes = body.subarray(z+2);          // z+1=compression method
+      out[key] = await inflate(textBytes);
+    }
+    if (type==='IEND') break;
+    pos = start + len + 4;                            // +4 はCRC
+  }
+  return out;
+}
+function utf8(bytes){ return new TextDecoder('utf-8').decode(bytes); }
+async function inflate(bytes){
+  // zlib(deflate)圧縮テキストを展開（modern Edge/Chrome対応）
+  const ds = new DecompressionStream('deflate');
+  const stream = new Response(new Blob([bytes]).stream().pipeThrough(ds));
+  return utf8(new Uint8Array(await stream.arrayBuffer()));
+}
+
+/* ===================== ポジティブ抽出ロジック(extractor.py移植) ===================== */
+const PREFIX_INPUTS = ['prefix'];
+const STRUCTURAL = new Set(['clip','model','vae','latent_image','samples','pixels','image']);
+
+function isSampler(node){
+  const ct = String(node.class_type||'');
+  const ins = node.inputs||{};
+  return ('positive' in ins) && (ct.includes('Sampler') || ct.startsWith('KSampler'));
+}
+function stripComments(text){
+  return String(text).split(/\r?\n/).map(l => l.split('//')[0].trim()).filter(Boolean).join('\n');
+}
+function isLink(v){ return Array.isArray(v) && v.length===2 && typeof v[0]==='string'; }
+
+function collectText(prompt, startId){
+  const parts = []; const visited = new Set();
+  function walk(nid){
+    if (visited.has(nid) || !(nid in prompt)) return;
+    visited.add(nid);
+    const ins = prompt[nid].inputs || {};
+    for (const key of PREFIX_INPUTS){
+      const v = ins[key];
+      if (isLink(v)) walk(v[0]);
+    }
+    if (typeof ins.text === 'string'){
+      const c = stripComments(ins.text);
+      if (c) parts.push(c);
+    }
+    for (const key in ins){
+      if (PREFIX_INPUTS.includes(key) || STRUCTURAL.has(key)) continue;
+      const v = ins[key];
+      if (isLink(v)) walk(v[0]);
+    }
+  }
+  walk(startId);
+  return parts;
+}
+function joinParts(parts){
+  const seen = new Set(); const uniq = [];
+  for (const p of parts){ if (!seen.has(p)){ seen.add(p); uniq.push(p); } }
+  return uniq.join('\n').trim();
+}
+function extractComfy(prompt){
+  const samplers = Object.entries(prompt).filter(([id,n]) => isSampler(n));
+  let pos = [], neg = [];
+  for (const [id,n] of samplers){
+    const ins = n.inputs;
+    if (isLink(ins.positive)) pos = pos.concat(collectText(prompt, ins.positive[0]));
+    if (isLink(ins.negative)) neg = neg.concat(collectText(prompt, ins.negative[0]));
+  }
+  let positive = joinParts(pos);
+  if (!positive){
+    const encs = Object.values(prompt)
+      .filter(n => n.class_type==='CLIPTextEncode' && typeof (n.inputs||{}).text==='string')
+      .map(n => stripComments(n.inputs.text)).filter(Boolean);
+    if (encs.length) positive = encs.reduce((a,b)=> b.length>a.length?b:a);
+  }
+  return { positive, negative: joinParts(neg) };
+}
+function extractA1111(parameters){
+  const i = parameters.indexOf('Negative prompt:');
+  if (i!==-1){
+    const positive = parameters.slice(0,i).trim();
+    let rest = parameters.slice(i + 'Negative prompt:'.length);
+    const m = rest.match(/\n[A-Z][A-Za-z ]+:/);
+    const negative = (m ? rest.slice(0,m.index) : rest).trim();
+    return { positive, negative };
+  }
+  const m = parameters.match(/\n(Steps|Sampler|CFG|Seed|Size|Model):/);
+  return { positive: (m ? parameters.slice(0,m.index) : parameters).trim(), negative:'' };
+}
+async function extractFromFile(file){
+  const buf = await file.arrayBuffer();
+  let info;
+  try { info = await readPngText(buf); }
+  catch(e){ return { ok:false, filename:file.name, source:'error', positive:'', error:e.message }; }
+  if ('prompt' in info){
+    try {
+      const r = extractComfy(JSON.parse(info.prompt));
+      return { ok: !!r.positive, filename:file.name, source:'ComfyUI', positive:r.positive, negative:r.negative,
+               error: r.positive?'':'positiveが見つかりませんでした' };
+    } catch(e){
+      return { ok:false, filename:file.name, source:'ComfyUI', positive:'', error:'JSON解析エラー: '+e.message };
+    }
+  }
+  if ('parameters' in info){
+    const r = extractA1111(info.parameters);
+    return { ok: !!r.positive, filename:file.name, source:'A1111/Forge', positive:r.positive, negative:r.negative };
+  }
+  return { ok:false, filename:file.name, source:'unknown', positive:'',
+           error:'メタプロンプトが見つかりません(prompt/parametersチャンクなし)' };
+}
+
+/* ===================== UI ===================== */
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+const list = document.getElementById('list');
+const countEl = document.getElementById('count');
+const csvBtn = document.getElementById('csv');
+const clearBtn = document.getElementById('clear');
+const fmtChk = document.getElementById('fmt');
+let results = [];
+let formatOneLine = false;
+
+/* 改行を全部カンマ区切りにして1行へ。タグ(行/既存カンマ)単位は壊さず区切りだけ統一 */
+function normalizePrompt(text){
+  return String(text)
+    .split(/[\n,]+/)        // 改行・カンマで分割
+    .map(s => s.trim())
+    .filter(Boolean)
+    .join(', ');            // カンマ+スペースで再結合（1行）
+}
+function displayText(r){ return formatOneLine ? normalizePrompt(r.positive) : r.positive; }
+
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hot'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hot'); }));
+drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+
+async function handleFiles(files){
+  for (const f of files){
+    if (!f.type.startsWith('image/') && !f.name.toLowerCase().endsWith('.png')) continue;
+    const r = await extractFromFile(f);
+    results.push(r);
+    renderOne(r);
+  }
+  update();
+}
+function renderAll(){ list.innerHTML=''; results.forEach(renderOne); }
+function renderOne(r){
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    <div class="fn">
+      <span>${esc(r.filename)} <span style="opacity:.6">· ${esc(r.source||'')}</span></span>
+      <span class="tag ${r.ok?'ok':'ng'}">${r.ok?'抽出OK':'抽出できず'}</span>
+    </div>
+    ${ r.ok
+      ? `<textarea readonly>${esc(displayText(r))}</textarea>
+         <div class="row"><button data-copy>コピー</button><span class="copyd">コピーしました</span></div>`
+      : `<div style="color:var(--ng);font-size:13px;margin-top:8px">${esc(r.error||'メタプロンプトなし')}</div>` }`;
+  if (r.ok){
+    const ta = card.querySelector('textarea');
+    const done = card.querySelector('.copyd');
+    card.querySelector('[data-copy]').addEventListener('click', () => {
+      navigator.clipboard.writeText(ta.value);
+      done.classList.add('show'); setTimeout(()=>done.classList.remove('show'),1200);
+    });
+  }
+  list.prepend(card);
+}
+fmtChk.addEventListener('change', () => { formatOneLine = fmtChk.checked; renderAll(); });
+function update(){
+  countEl.textContent = results.length + ' 件';
+  csvBtn.disabled = results.filter(r=>r.ok).length===0;
+  clearBtn.disabled = results.length===0;
+}
+csvBtn.addEventListener('click', () => {
+  const rows = [['filename','source','positive']];
+  results.forEach(r => rows.push([r.filename, r.source||'', r.ok ? displayText(r) : '']));
+  const csv = '﻿' + rows.map(row => row.map(c => '"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download = 'positive_prompts.csv'; a.click();
+});
+clearBtn.addEventListener('click', () => { results=[]; list.innerHTML=''; update(); });
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+</script>
+</body>
+</html>
