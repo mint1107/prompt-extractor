@@ -46,7 +46,7 @@
   <div class="bar">
     <span class="count" id="count">0 件</span>
     <label class="fmt"><input type="checkbox" id="fmt"> ✨ 1行に整形（カンマ区切り）</label>
-    <button class="ghost" id="csv" disabled>📋 CSVをダウンロード</button>
+    <button class="ghost" id="csv" disabled>💾 テキストをダウンロード</button>
     <button class="ghost" id="clear" disabled>クリア</button>
   </div>
 
@@ -259,12 +259,14 @@ function update(){
   clearBtn.disabled = results.length===0;
 }
 csvBtn.addEventListener('click', () => {
-  const rows = [['filename','source','positive']];
-  results.forEach(r => rows.push([r.filename, r.source||'', r.ok ? displayText(r) : '']));
-  const csv = '﻿' + rows.map(row => row.map(c => '"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+  // 抽出できたものだけ、1プロンプト=1行に整形してプレーンテキストで出力
+  const lines = results
+    .filter(r => r.ok && r.positive)
+    .map(r => normalizePrompt(r.positive));   // 改行を除去して必ず1行へ
+  const txt = lines.join('\n');
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
-  a.download = 'positive_prompts.csv'; a.click();
+  a.href = URL.createObjectURL(new Blob([txt],{type:'text/plain;charset=utf-8'}));
+  a.download = 'positive_prompts.txt'; a.click();
 });
 clearBtn.addEventListener('click', () => { results=[]; list.innerHTML=''; update(); });
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
